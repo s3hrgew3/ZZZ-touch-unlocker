@@ -8,6 +8,8 @@ The tool restores the game's native Windows touch path, enables the native mobil
 
 Updated for **Zenless Zone Zero 3.2**: the incompatible save hook has been removed, and a launch option now forces the selected layout. Offline pattern checks, compilation, and argument checks have passed, and in-game behavior has been verified by the user. The earlier mobile implementation was verified on **3.1.0**.
 
+Updated for **Zenless Zone Zero 3.3**: Verified, still works, no changes needed.
+
 ## Download and use
 
 Download the latest package from [Releases](../../releases/latest), extract it, and keep these two files together:
