@@ -135,6 +135,21 @@ cmake --build build --config Release --parallel
 
 GitHub Actions also builds the project automatically. Pushing a tag such as `v0.1.0` creates a GitHub Release with the Windows x64 package.
 
+## Linux / Wine
+
+The Windows launcher cannot be used under Wine: it injects into a suspended child process, which makes that child the *second* wine client of the prefix, and the anti-cheat driver never gets its first-client handshake (the game then exits silently after about 5 s).
+
+`wine/zzz-touch-unlocker` therefore owns the launch order instead:
+
+```bash
+./scripts/build-wine.sh                 # cross-compile with MinGW (dist/wine/)
+dist/wine/zzz-touch-unlocker run -m 1   # clean prefix -> launch game -> attach hook
+```
+
+It empties the prefix (the game must be the first wine client), starts the game with one wine command, waits for the anti-cheat stage to finish, and only then loads the hook with `zzz-touch-inject.exe`. The mode is handed to the hook through `zzz-touch-mode.txt`, so the attach needs no environment import. `attach`, `clean` and `status` are available as separate subcommands.
+
+Configuration is read from the sleepy-launcher `config.json`, so the game path, prefix and runner normally need no flags. Details, log interpretation and troubleshooting: [wine/README.md](wine/README.md). `wine/zzz-touch-selftest.sh` exercises the whole flow against a synthetic window target without the game.
+
 ## How it works
 
 The runtime performs two operations.

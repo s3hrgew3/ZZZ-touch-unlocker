@@ -1,5 +1,10 @@
 # =============================================================================
 # zzz-touch-unlocker — runtime-only native touch + mobile UI restore
+#
+# Native (MSVC / MinGW-w64) and Wine (MinGW-w64 cross build) targets share the
+# same sources. Wine support only changes how the hook reaches the game:
+#   native  zzz-touch-unlocker.exe  create suspended -> inject -> resume
+#   wine    wine/zzz-touch-unlocker game first       -> zzz-touch-inject.exe
 # =============================================================================
 
 cmake_minimum_required(VERSION 3.20)
@@ -28,6 +33,15 @@ else()
                             UNICODE _UNICODE)
 endif()
 
+# MinGW: link the C++ runtime statically so the DLL and the tools can be copied
+# into a Wine prefix without shipping libstdc++-6.dll / libgcc_s_seh-1.dll.
+if(MINGW)
+    add_link_options(-static -static-libgcc -static-libstdc++)
+endif()
+
+# -----------------------------------------------------------------------------
+# Hook DLL
+# -----------------------------------------------------------------------------
 add_library(zzz_touch_hook SHARED
     hook/dllmain.cpp
     hook/touch_hook.cpp
@@ -43,9 +57,43 @@ set_target_properties(zzz_touch_hook PROPERTIES
 target_include_directories(zzz_touch_hook PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/hook)
 target_link_libraries(zzz_touch_hook PRIVATE kernel32)
 
+# -----------------------------------------------------------------------------
+# Injection primitives shared by the launcher and the attach-mode injector
+# -----------------------------------------------------------------------------
+add_library(zzz_inject STATIC launcher/inject.cpp)
+target_include_directories(zzz_inject PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/launcher)
+target_link_libraries(zzz_inject PUBLIC kernel32)
+
+# -----------------------------------------------------------------------------
+# Windows launcher (native only, refuses to run under Wine)
+# -----------------------------------------------------------------------------
 add_executable(zzz_touch_unlocker launcher/main.cpp)
 set_target_properties(zzz_touch_unlocker PROPERTIES OUTPUT_NAME "zzz-touch-unlocker")
-target_link_libraries(zzz_touch_unlocker PRIVATE kernel32)
+target_link_libraries(zzz_touch_unlocker PRIVATE zzz_inject)
 if(NOT MSVC)
-    set_target_properties(zzz_touch_unlocker PROPERTIES LINK_FLAGS "-municode")
+    target_link_options(zzz_touch_unlocker PRIVATE -municode)
+endif()
+
+# -----------------------------------------------------------------------------
+# Attach-mode injector (Wine path, also useful on Windows for a running game)
+# -----------------------------------------------------------------------------
+add_executable(zzz_touch_inject launcher/inject_main.cpp)
+set_target_properties(zzz_touch_inject PROPERTIES OUTPUT_NAME "zzz-touch-inject")
+target_link_libraries(zzz_touch_inject PRIVATE zzz_inject)
+if(NOT MSVC)
+    target_link_options(zzz_touch_inject PRIVATE -municode)
+endif()
+
+# -----------------------------------------------------------------------------
+# Regression tests (native build only; the argument parser is platform neutral)
+# -----------------------------------------------------------------------------
+option(ZZZ_BUILD_TESTS "Build standalone regression tests" ON)
+if(ZZZ_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
+    enable_testing()
+    add_executable(launcher_args_test tests/launcher_args_test.cpp)
+    target_link_libraries(launcher_args_test PRIVATE zzz_inject)
+    if(NOT MSVC)
+        target_link_options(launcher_args_test PRIVATE -municode)
+    endif()
+    add_test(NAME launcher_args COMMAND launcher_args_test)
 endif()

@@ -1,5 +1,6 @@
 third_party
 build
+build-wine
 dist
 analysis
 docs

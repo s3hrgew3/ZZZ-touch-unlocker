@@ -72,8 +72,15 @@ void WriteToFile(const char* line, size_t len, bool flush) {
 
 void Init(const wchar_t* root_dir) {
     std::call_once(g_initFlag, [&] {
-        if (root_dir && *root_dir) {
-            std::wstring root = root_dir;
+        // ZZZ_TOUCH_LOG_DIR lets the Wine wrapper collect logs outside the
+        // hook directory (the launcher itself never sets it).
+        wchar_t override_dir[MAX_PATH]{};
+        const DWORD override_len =
+            GetEnvironmentVariableW(L"ZZZ_TOUCH_LOG_DIR", override_dir, MAX_PATH);
+        const wchar_t* effective =
+            override_len > 0 && override_len < MAX_PATH ? override_dir : root_dir;
+        if (effective && *effective) {
+            std::wstring root = effective;
             while (!root.empty() && (root.back() == L'\\' || root.back() == L'/'))
                 root.pop_back();
 

@@ -135,6 +135,21 @@ cmake --build build --config Release --parallel
 
 仓库也配置了 GitHub Actions 自动编译。推送 `v0.1.0` 这类 tag 后，会自动创建 GitHub Release 并上传 Windows x64 压缩包。
 
+## Linux / Wine
+
+Windows 版启动器无法在 Wine 下工作：它会先挂起子进程再注入，这个子进程就成了该 prefix 的**第二个** wine 客户端，反作弊驱动拿不到首个客户端的初始化握手，游戏会在约 5 秒后静默退出。
+
+因此 Linux 下改由 `wine/zzz-touch-unlocker` 掌控启动顺序：
+
+```bash
+./scripts/build-wine.sh                 # 用 MinGW 交叉编译到 dist/wine/
+dist/wine/zzz-touch-unlocker run -m 1   # 清空 prefix -> 启动游戏 -> 附着 hook
+```
+
+它先清空 prefix（游戏必须是首个 wine 客户端），用一条 wine 命令启动游戏，等反作弊阶段结束后再用 `zzz-touch-inject.exe` 载入 hook。模式通过 `zzz-touch-mode.txt` 传给 hook，附着过程不需要导入环境变量。另有 `attach`、`clean`、`status` 三个子命令。
+
+配置默认读取 sleepy-launcher 的 `config.json`，游戏路径、prefix、runner 一般不需要额外参数。日志含义与排障见 [wine/README.md](wine/README.md)；`wine/zzz-touch-selftest.sh` 用合成窗口目标跑通全流程，不需要游戏本体。
+
 ## 实现原理
 
 运行时进行两项核心操作。

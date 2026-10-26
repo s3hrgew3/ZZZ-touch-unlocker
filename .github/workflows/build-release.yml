@@ -60,9 +60,39 @@ jobs:
           path: ${{ steps.package.outputs.zip }}
           if-no-files-found: error
 
+  build-wine:
+    name: Build (MinGW cross, Wine runtime scripts)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++-mingw-w64-x86-64
+
+      - name: Build
+        run: ./scripts/build-wine.sh
+
+      - name: Shell syntax
+        run: |
+          bash -n wine/zzz-touch-unlocker
+          bash -n wine/zzz-touch-selftest.sh
+          bash -n scripts/build-wine.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zzz-touch-unlocker-wine64
+          path: dist/wine/
+          if-no-files-found: error
+
   release:
     if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/v')
-    needs: build
+    needs: [build, build-wine]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -1,6 +1,8 @@
 // launcher/main.cpp — minimal fail-closed launcher for zzz-touch-unlocker.
 #include <windows.h>
 
+#include "inject.h"
+
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -101,61 +103,7 @@ bool FileExists(const std::wstring& path) {
 }
 
 bool InjectDll(HANDLE process, const std::wstring& dllPath) {
-    if (!process) return false;
-
-    const SIZE_T bytes = (dllPath.size() + 1) * sizeof(wchar_t);
-    LPVOID remote = VirtualAllocEx(process, nullptr, bytes,
-                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remote) {
-        wprintf(L"VirtualAllocEx failed: %lu\n", GetLastError());
-        return false;
-    }
-
-    if (!WriteProcessMemory(process, remote, dllPath.c_str(), bytes, nullptr)) {
-        wprintf(L"WriteProcessMemory failed: %lu\n", GetLastError());
-        VirtualFreeEx(process, remote, 0, MEM_RELEASE);
-        return false;
-    }
-
-    const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-    auto loadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(
-        kernel32 ? GetProcAddress(kernel32, "LoadLibraryW") : nullptr);
-    if (!loadLibrary) {
-        wprintf(L"GetProcAddress(LoadLibraryW) failed: %lu\n", GetLastError());
-        VirtualFreeEx(process, remote, 0, MEM_RELEASE);
-        return false;
-    }
-
-    HANDLE thread = CreateRemoteThread(process, nullptr, 0, loadLibrary,
-                                       remote, 0, nullptr);
-    if (!thread) {
-        wprintf(L"CreateRemoteThread failed: %lu\n", GetLastError());
-        VirtualFreeEx(process, remote, 0, MEM_RELEASE);
-        return false;
-    }
-
-    const DWORD wait = WaitForSingleObject(thread, 15000);
-    if (wait != WAIT_OBJECT_0) {
-        wprintf(L"[inject] LoadLibraryW wait failed/timeout: %lu\n", wait);
-        // The remote thread may still be reading the path; leave the allocation
-        // intact. The suspended target will be terminated by the caller.
-        CloseHandle(thread);
-        return false;
-    }
-
-    DWORD code = 0;
-    const bool gotExit = GetExitCodeThread(thread, &code) != FALSE;
-    CloseHandle(thread);
-    VirtualFreeEx(process, remote, 0, MEM_RELEASE);
-
-    if (!gotExit || code == 0 || code == STILL_ACTIVE) {
-        wprintf(L"[inject] LoadLibraryW failed, exit=0x%08lX gle=%lu\n",
-                code, GetLastError());
-        return false;
-    }
-
-    wprintf(L"[inject] LoadLibraryW succeeded\n");
-    return true;
+    return zzz::inject::InjectDllByHandle(process, dllPath);
 }
 
 bool LaunchSuspendedAndInject(const std::wstring& gamePath,
@@ -213,6 +161,22 @@ int wmain(int argc, wchar_t** argv) {
     if (!ParseArgs(argc, argv, opt)) {
         PrintUsage();
         return 1;
+    }
+
+    // This launcher is structurally incompatible with Wine: it creates the
+    // game suspended and injects from its own process, which makes the
+    // unlocker a wineserver client that loads zzz-touch-hook.dll before the
+    // game's anti-cheat runs. HoYoKProtect then sees a foreign first client and
+    // the game exits silently. Wine launches go through wine/zzz-touch-unlocker
+    // instead (game first, attach injection second).
+    if (zzz::inject::IsWine()) {
+        const std::string wine = zzz::inject::WineVersion();
+        wprintf(L"ERROR: zzz-touch-unlocker.exe cannot run under Wine (wine=%hs).\n",
+                wine.c_str());
+        wprintf(L"Wine requires the game to be the first wineserver client:\n");
+        wprintf(L"  wine/zzz-touch-unlocker run -m %d\n", opt.mode);
+        wprintf(L"See wine/README.md for the launch-ordering rules.\n");
+        return 4;
     }
 
     const std::wstring dllPath = GetDllPath();

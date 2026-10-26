@@ -1,0 +1,593 @@
+#!/usr/bin/env bash
+# =============================================================================
+# zzz-touch-unlocker — Wine launcher (POSIX wrapper)
+#
+# Why this exists
+# ---------------
+# HoYoKProtect only loads its kernel driver when the game is the *first* wine
+# client of the prefix. The native Windows launcher (zzz-touch-unlocker.exe)
+# cannot satisfy that: it is itself a wine client and it injects the hook into
+# the game from its own process, so the game is always the second client and
+# exits silently (NtRaiseHardError 0x50000018, no window, ~5 s).
+#
+# This wrapper therefore:
+#   1. kills every wine client of the prefix (fresh wineserver),
+#   2. starts the game as the first client,
+#   3. waits until the anti-cheat stage is over,
+#   4. injects zzz-touch-hook.dll with zzz-touch-inject.exe as the second client.
+#
+# Usage:
+#   zzz-touch-unlocker [run] [-m 0|1] [--] [game args...]
+#   zzz-touch-unlocker attach [-m 0|1] [--pid N]
+#   zzz-touch-unlocker clean
+#   zzz-touch-unlocker status
+#
+# See wine/README.md for the full model, options and troubleshooting.
+# =============================================================================
+set -uo pipefail
+
+PROG=${0##*/}
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+CMD=run
+MODE=1
+EDITION=""
+GAME_DIR=""
+GAME_EXE=""
+PREFIX=""
+RUNNER=""
+DLL=""
+INJECT_EXE=""
+LOG_DIR=""
+GAME_LOG_FILE=""
+GRACE_MS=6000
+WAIT_MS=120000
+TARGET_PID=""
+TARGET_NAME=""
+NO_CLEAN=0
+NO_INJECT=0
+DRY_RUN=0
+QUIET=0
+GAME_ARGS=()
+EXTRA_ENV=()
+
+say() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+warn() { printf 'warn: %s\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit "${EXIT_CODE:-1}"; }
+
+usage() {
+    cat <<EOF
+$PROG — Wine launcher for zzz-touch-unlocker
+
+  $PROG [run] [options] [--] [game args...]   launch the game (first wine client)
+                                              and attach the hook
+  $PROG attach [options]                      attach the hook to a running game
+  $PROG clean                                 kill every wine client of the prefix
+  $PROG status                                show detection + running state
+
+Options
+  -m, --mode 0|1       0 = desktop UI, 1 = mobile UI (default 1)
+      --edition E      china | global (default: launcher config or china)
+      --game PATH      game directory (or the .exe itself)
+      --prefix DIR     wine prefix
+      --runner DIR     wine runner directory (contains bin/wine)
+      --dll FILE       hook DLL (default: <this dir>/zzz-touch-hook.dll)
+      --inject-exe F   injector (default: <this dir>/zzz-touch-inject.exe)
+      --grace-ms N     wait at most N ms for the anti-cheat stage to finish
+                       before injecting (default $GRACE_MS)
+      --wait-ms N      wait at most N ms for the game process (default $WAIT_MS)
+      --pid N          attach target (attach only)
+      --name N         Windows image name of the target
+                       (default: basename of the game executable)
+      --log-dir DIR    hook log directory (default: next to the DLL)
+      --game-log FILE  stdout/stderr of the game (default: <log dir>/game.log)
+      --env K=V        extra environment variable for the game (repeatable)
+      --no-clean       do not kill existing wine clients
+      --no-inject      launch only, do not attach
+      --dry-run        print what would run
+  -q, --quiet           less output
+  -h, --help            this text
+
+Exit codes: 0 ok, 1 usage/preflight, 2 game exited early, 3 injection failed,
+            4 prefix not clean
+EOF
+}
+
+arg_value() { # $1=option name, $2=next arg
+    [ $# -ge 2 ] && [ -n "${2:-}" ] || die "$1 needs a value"
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            run|attach|clean|status) CMD=$1 ;;
+            -m|--mode)
+                arg_value "$1" "${2:-}"; MODE=$2; shift ;;
+            --mode=*) MODE=${1#*=} ;;
+            --edition)
+                arg_value "$1" "${2:-}"; EDITION=$2; shift ;;
+            --edition=*) EDITION=${1#*=} ;;
+            --game)
+                arg_value "$1" "${2:-}"; GAME_DIR=$2; shift ;;
+            --game=*) GAME_DIR=${1#*=} ;;
+            --prefix)
+                arg_value "$1" "${2:-}"; PREFIX=$2; shift ;;
+            --prefix=*) PREFIX=${1#*=} ;;
+            --runner)
+                arg_value "$1" "${2:-}"; RUNNER=$2; shift ;;
+            --runner=*) RUNNER=${1#*=} ;;
+            --dll)
+                arg_value "$1" "${2:-}"; DLL=$2; shift ;;
+            --dll=*) DLL=${1#*=} ;;
+            --inject-exe)
+                arg_value "$1" "${2:-}"; INJECT_EXE=$2; shift ;;
+            --inject-exe=*) INJECT_EXE=${1#*=} ;;
+            --log-dir)
+                arg_value "$1" "${2:-}"; LOG_DIR=$2; shift ;;
+            --log-dir=*) LOG_DIR=${1#*=} ;;
+            --game-log)
+                arg_value "$1" "${2:-}"; GAME_LOG_FILE=$2; shift ;;
+            --game-log=*) GAME_LOG_FILE=${1#*=} ;;
+            --grace-ms)
+                arg_value "$1" "${2:-}"; GRACE_MS=$2; shift ;;
+            --grace-ms=*) GRACE_MS=${1#*=} ;;
+            --wait-ms)
+                arg_value "$1" "${2:-}"; WAIT_MS=$2; shift ;;
+            --wait-ms=*) WAIT_MS=${1#*=} ;;
+            --pid)
+                arg_value "$1" "${2:-}"; TARGET_PID=$2; shift ;;
+            --pid=*) TARGET_PID=${1#*=} ;;
+            --name)
+                arg_value "$1" "${2:-}"; TARGET_NAME=$2; shift ;;
+            --name=*) TARGET_NAME=${1#*=} ;;
+            --env)
+                arg_value "$1" "${2:-}"; EXTRA_ENV+=("$2"); shift ;;
+            --env=*) EXTRA_ENV+=("${1#*=}") ;;
+            --no-clean) NO_CLEAN=1 ;;
+            --no-inject) NO_INJECT=1 ;;
+            --dry-run) DRY_RUN=1 ;;
+            -q|--quiet) QUIET=1 ;;
+            -h|--help) usage; exit 0 ;;
+            --) shift; GAME_ARGS+=("$@"); break ;;
+            -*) die "unknown option: $1" ;;
+            *) GAME_ARGS+=("$1") ;;
+        esac
+        shift
+    done
+    case "$MODE" in 0|1) ;; *) die "mode must be 0 or 1" ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# Configuration (sleepy-launcher config.json, overridable by flags/env)
+# ---------------------------------------------------------------------------
+CONFIG=""
+CFG_EDITION=""
+CFG_GAME_CHINA=""
+CFG_GAME_GLOBAL=""
+CFG_PREFIX=""
+CFG_RUNNERS=""
+CFG_RUNNER_SELECTED=""
+
+find_config() {
+    local candidate
+    for candidate in "${ZZZ_CONFIG:-}" \
+                     "$SELF_DIR/config.json" \
+                     "$SELF_DIR/../config.json" \
+                     "$SELF_DIR/../../config.json" \
+                     "$HOME/.local/share/sleepy-launcher/config.json"; do
+        [ -n "$candidate" ] && [ -f "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+load_config() {
+    CONFIG=$(find_config) || return 0
+    command -v python3 >/dev/null 2>&1 || { warn "python3 missing, ignoring $CONFIG"; return 0; }
+    local out
+    out=$(python3 - "$CONFIG" <<'PY' 2>/dev/null
+import json, shlex, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+def get(*keys):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return ""
+        cur = cur.get(k, "")
+    if isinstance(cur, bool):
+        return "1" if cur else "0"
+    return cur if isinstance(cur, str) else ""
+fields = {
+    "CFG_EDITION": get("launcher", "edition"),
+    "CFG_GAME_CHINA": get("game", "path", "china"),
+    "CFG_GAME_GLOBAL": get("game", "path", "global"),
+    "CFG_PREFIX": get("game", "wine", "prefix"),
+    "CFG_RUNNERS": get("game", "wine", "builds"),
+    "CFG_RUNNER_SELECTED": get("game", "wine", "selected"),
+}
+for name, value in fields.items():
+    print(f"{name}={shlex.quote(value)}")
+PY
+) || return 0
+    eval "$out"
+}
+
+resolve_paths() {
+    local edition="${EDITION:-${ZZZ_EDITION:-${CFG_EDITION:-China}}}"
+    edition=$(printf '%s' "$edition" | tr '[:upper:]' '[:lower:]')
+    case "$edition" in
+        china|cn|国服) edition=china ;;
+        global|os|国际服) edition=global ;;
+        *) die "unknown edition: $edition" ;;
+    esac
+
+    if [ -z "$GAME_DIR" ]; then
+        case "$edition" in
+            china) GAME_DIR="${ZZZ_GAME:-$CFG_GAME_CHINA}" ;;
+            global) GAME_DIR="${ZZZ_GAME:-$CFG_GAME_GLOBAL}" ;;
+        esac
+    fi
+    if [ -z "$PREFIX" ]; then PREFIX="${ZZZ_PREFIX:-$CFG_PREFIX}"; fi
+    if [ -z "$RUNNER" ]; then
+        RUNNER="${ZZZ_RUNNER:-}"
+        if [ -z "$RUNNER" ] && [ -n "$CFG_RUNNERS" ] && [ -n "$CFG_RUNNER_SELECTED" ]; then
+            RUNNER="$CFG_RUNNERS/$CFG_RUNNER_SELECTED"
+        fi
+    fi
+
+    if [ -n "$GAME_DIR" ] && [ -d "$GAME_DIR" ]; then
+        GAME_EXE="$GAME_DIR/ZenlessZoneZero.exe"
+        [ -f "$GAME_EXE" ] || GAME_EXE=$(find "$GAME_DIR" -maxdepth 2 -name ZenlessZoneZero.exe -print -quit 2>/dev/null)
+        GAME_DIR=$(dirname "${GAME_EXE:-$GAME_DIR}")
+    elif [ -n "$GAME_DIR" ] && [ -f "$GAME_DIR" ]; then
+        GAME_EXE=$GAME_DIR
+        GAME_DIR=$(dirname "$GAME_EXE")
+    fi
+
+    if [ -z "$TARGET_NAME" ] && [ -n "$GAME_EXE" ]; then TARGET_NAME=${GAME_EXE##*/}; fi
+    [ -n "$TARGET_NAME" ] || TARGET_NAME=ZenlessZoneZero.exe
+
+    [ -n "$DLL" ] || DLL="$SELF_DIR/zzz-touch-hook.dll"
+    [ -n "$INJECT_EXE" ] || INJECT_EXE="$SELF_DIR/zzz-touch-inject.exe"
+    [ -n "$LOG_DIR" ] || LOG_DIR="${ZZZ_TOUCH_LOG_DIR:-$(dirname "$DLL")}"
+    [ -n "$GAME_LOG_FILE" ] || GAME_LOG_FILE="$LOG_DIR/game.log"
+}
+
+wine_bin() { printf '%s' "$RUNNER/bin/wine"; }
+wineserver_bin() { printf '%s' "$RUNNER/bin/wineserver"; }
+
+preflight_run() {
+    [ -n "$GAME_EXE" ] && [ -f "$GAME_EXE" ] || die "game executable not found (use --game)"
+    [ -n "$PREFIX" ] && [ -d "$PREFIX" ] || die "wine prefix not found (use --prefix)"
+    [ -n "$RUNNER" ] && [ -x "$(wine_bin)" ] || die "wine runner not found (use --runner)"
+    [ -f "$DLL" ] || die "hook DLL not found: $DLL (run scripts/build-wine.sh)"
+    [ -f "$INJECT_EXE" ] || die "injector not found: $INJECT_EXE (run scripts/build-wine.sh)"
+    mkdir -p "$LOG_DIR" || die "cannot create log dir: $LOG_DIR"
+}
+
+# ---------------------------------------------------------------------------
+# Process helpers
+# ---------------------------------------------------------------------------
+pid_comm() { [ -r "/proc/$1/comm" ] && head -c 64 "/proc/$1/comm" 2>/dev/null | tr -d '\n'; }
+
+pid_state() { # single-letter process state, "" when the pid is gone
+    local stat
+    [ -r "/proc/$1/stat" ] || return 0
+    read -r stat <"/proc/$1/stat" 2>/dev/null || return 0
+    stat=${stat##*) }
+    printf '%s' "${stat%% *}"
+}
+
+game_pids_in_prefix() { # every prefix client with the target image mapped
+    local pid
+    for pid in $(prefix_clients); do
+        grep -qF "$TARGET_NAME" "/proc/$pid/maps" 2>/dev/null && printf '%s\n' "$pid"
+    done
+}
+
+game_pid_in_prefix() { # first prefix client with the target image mapped
+    local pid
+    pid=$(game_pids_in_prefix | head -1)
+    [ -n "$pid" ] || return 1
+    printf '%s\n' "$pid"
+}
+
+game_pids_outside_prefix() { # same image name, but not a client of this prefix
+    local pid clients outside=""
+    clients=" $(prefix_clients 2>/dev/null | tr '\n' ' ')"
+    for pid in $(pids_by_maps "$TARGET_NAME"); do
+        case "$clients" in *" $pid "*) continue ;; esac
+        outside="$outside $pid"
+    done
+    printf '%s\n' ${outside# }
+}
+
+pids_by_maps() { # pids with a mapped image containing this substring
+    local needle=$1 file pid
+    for file in /proc/[0-9]*/maps; do
+        [ -r "$file" ] || continue
+        grep -qF "$needle" "$file" 2>/dev/null || continue
+        pid=${file#/proc/}
+        printf '%s\n' "${pid%/maps}"
+    done
+}
+
+pids_by_comm() { # exact image name
+    local name=$1 file pid
+    for file in /proc/[0-9]*/comm; do
+        [ -r "$file" ] || continue
+        [ "$(head -c 64 "$file" 2>/dev/null | tr -d '\n')" = "$name" ] || continue
+        pid=${file#/proc/}
+        printf '%s\n' "${pid%/comm}"
+    done
+}
+
+prefix_pids_by_comm() { # prefix clients whose image name matches exactly
+    local pid
+    for pid in $(prefix_clients); do
+        [ "$(pid_comm "$pid")" = "$1" ] && printf '%s\n' "$pid"
+    done
+}
+
+prefix_clients() { # pids whose environment points at $PREFIX (excluding us)
+    local dir pid
+    for dir in /proc/[0-9]*; do
+        pid=${dir#/proc/}
+        [ "$pid" = "$$" ] && continue
+        # only processes owned by us can be wine clients of our own prefix
+        [ -O "$dir" ] || continue
+        [ -r "$dir/environ" ] || continue
+        # redirection lives inside the subshell so unreadable entries stay silent
+        ( tr '\0' '\n' <"$dir/environ" ) 2>/dev/null | grep -qxF "WINEPREFIX=$PREFIX" || continue
+        # zombies still own /proc/<pid>/environ but no longer hold the server open
+        [ "$(pid_state "$pid")" = "Z" ] && continue
+        printf '%s\n' "$pid"
+    done
+}
+
+player_log_path() {
+    local file
+    file=$(compgen -G "$PREFIX/drive_c/users/*/AppData/LocalLow/miHoYo/*/Player.log" 2>/dev/null | head -1)
+    [ -n "$file" ] && printf '%s\n' "$file"
+}
+
+now_ms() { date +%s%3N; }
+
+write_mode_file() {
+    local dir
+    dir=$(dirname "$DLL")
+    printf '%s\n' "$MODE" >"$dir/zzz-touch-mode.txt" || die "cannot write $dir/zzz-touch-mode.txt"
+    say "mode file: $dir/zzz-touch-mode.txt = $MODE ($([ "$MODE" = 1 ] && echo MOBILE || echo DESKTOP))"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+wait_prefix_gone() { # $1 = timeout in deciseconds
+    local i
+    for i in $(seq 1 "$1"); do
+        [ -z "$(prefix_clients)" ] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+cmd_clean() {
+    [ -n "$PREFIX" ] || die "no prefix configured (use --prefix)"
+    local pids remaining i
+    pids=$(prefix_clients | tr '\n' ' ')
+    if [ "$DRY_RUN" = 1 ]; then
+        say "would kill prefix clients: ${pids:-none}"
+        say "would run: WINEPREFIX=$PREFIX $(wineserver_bin) -k"
+        return 0
+    fi
+    if [ -n "${pids// /}" ]; then
+        say "killing prefix clients: $pids"
+        kill $pids 2>/dev/null || true
+        sleep 0.5
+    fi
+    if [ -x "$(wineserver_bin)" ]; then
+        say "wineserver -k"
+        WINEPREFIX="$PREFIX" "$(wineserver_bin)" -k 2>/dev/null || true
+    fi
+    wait_prefix_gone 30 || {
+        # driver hosts (winedevice.exe) ignore SIGTERM and can outlive -k
+        remaining=$(prefix_clients | tr '\n' ' ')
+        say "escalating to SIGKILL: $remaining"
+        kill -9 $remaining 2>/dev/null || true
+        wait_prefix_gone 30 || true
+    }
+    remaining=$(prefix_clients | tr '\n' ' ')
+    if [ -n "${remaining// /}" ]; then
+        EXIT_CODE=4 die "prefix still has wine clients: $remaining"
+    fi
+    say "prefix clean"
+}
+
+inject_hook() { # $1 = linux pid (informational); resolves the target by name
+    local pid=$1 out rc
+    # Wine keeps its own Windows pid space: the linux pid of the wine process is
+    # not a valid OpenProcess() target, so the injector looks the image up by
+    # name (Toolhelp) unless --pid was given explicitly.
+    local -a target_spec=(--name "$TARGET_NAME")
+    [ -n "$TARGET_PID" ] && target_spec=(--pid "$TARGET_PID")
+    say "injecting hook into $TARGET_NAME (wine pid space; unix pid $pid)"
+    if [ "$DRY_RUN" = 1 ]; then
+        say "  would run: WINEPREFIX=$PREFIX $(wine_bin) $INJECT_EXE ${target_spec[*]} --dll $DLL --mode $MODE"
+        return 0
+    fi
+    out=$(WINEPREFIX="$PREFIX" "$(wine_bin)" "$INJECT_EXE" "${target_spec[@]}" --dll "$DLL" \
+              --mode "$MODE" 2>&1)
+    rc=$?
+    printf '%s\n' "$out" | sed 's/^/  /'
+    if [ $rc -ne 0 ]; then
+        EXIT_CODE=3 die "injection failed (exit $rc); see the output above"
+    fi
+}
+
+cmd_run() {
+    preflight_run
+    command -v python3 >/dev/null 2>&1 || true
+
+    echo "zzz-touch-unlocker (wine)"
+    echo "  game   = $GAME_EXE"
+    echo "  prefix = $PREFIX"
+    echo "  runner = $RUNNER"
+    echo "  dll    = $DLL"
+    echo "  mode   = $MODE ($([ "$MODE" = 1 ] && echo mobile || echo desktop))"
+
+    [ "$NO_CLEAN" = 1 ] || cmd_clean
+    local clients
+    clients=$(prefix_clients | tr '\n' ' ')
+    if [ -n "${clients// /}" ]; then
+        EXIT_CODE=4 die "prefix is not clean ($clients); the game must be the first wine client"
+    fi
+
+    write_mode_file
+
+    local launch_epoch player_log start_ms now signal=""
+    launch_epoch=$(date +%s)
+    player_log=$(player_log_path 2>/dev/null || true)
+
+    say "starting the game (first wine client)"
+    if [ "$DRY_RUN" = 1 ]; then
+        say "  would run: cd $GAME_DIR && WINEPREFIX=$PREFIX $(wine_bin) $GAME_EXE ${GAME_ARGS[*]:-}"
+        [ "$NO_INJECT" = 1 ] && return 0
+        say "  would then attach the hook once the anti-cheat stage finished"
+        return 0
+    fi
+
+    (
+        cd "$GAME_DIR" || exit 1
+        export WINEPREFIX="$PREFIX"
+        export ZZZ_TOUCH_LOG_DIR="$LOG_DIR"
+        for kv in ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}; do export "${kv?}"; done
+        exec setsid "$(wine_bin)" "$GAME_EXE" ${GAME_ARGS[@]+"${GAME_ARGS[@]}"}
+    ) >>"$GAME_LOG_FILE" 2>&1 &
+    local game_pid=$!
+
+    # 1) wait until the game image is mapped inside *this* prefix. The runner's
+    #    steam stub keeps the unix process name (comm) at "steam.exe" and forks
+    #    the real game, so the mapped image is the reliable signal.
+    local launcher_pid=$game_pid deadline=$(( $(now_ms) + WAIT_MS )) game="" comm=""
+    while :; do
+        game=$(game_pid_in_prefix) || game=""
+        [ -n "$game" ] && break
+        kill -0 "$launcher_pid" 2>/dev/null || {
+            EXIT_CODE=2 die "game process died during startup; log: $GAME_LOG_FILE"
+        }
+        comm=$(pid_comm "$launcher_pid")
+        [ "$(now_ms)" -ge "$deadline" ] && {
+            EXIT_CODE=2 die "game image '$TARGET_NAME' not mapped within ${WAIT_MS}ms (comm: ${comm:-?})"
+        }
+        sleep 0.2
+    done
+    game_pid=$game
+    say "game pid $game_pid is up ($(($(date +%s) - launch_epoch))s)"
+
+    [ "$NO_INJECT" = 1 ] && { say "--no-inject: leaving the game alone"; return 0; }
+
+    # 2) wait for the anti-cheat stage (driver load / Unity init) before becoming
+    #    the second wine client: attaching earlier is what trips HoYoKProtect.
+    start_ms=$(now_ms)
+    while :; do
+        kill -0 "$game_pid" 2>/dev/null || {
+            EXIT_CODE=2 die "game exited during the anti-cheat stage (protect kill?); log: $GAME_LOG_FILE"
+        }
+        first=$(prefix_pids_by_comm winedevice.exe 2>/dev/null)
+        if [ -n "${first%%[[:space:]]*}" ]; then
+            signal="winedevice"; break
+        fi
+        if [ -n "$player_log" ] && [ -f "$player_log" ] && \
+           [ "$(stat -c %Y "$player_log" 2>/dev/null || echo 0)" -ge "$launch_epoch" ]; then
+            signal="player.log"; break
+        fi
+        now=$(now_ms)
+        [ $((now - start_ms)) -ge "$GRACE_MS" ] && { signal="grace"; break; }
+        sleep 0.1
+    done
+    say "anti-cheat stage cleared after $(( ($(now_ms) - start_ms) ))ms (signal: $signal)"
+
+    inject_hook "$game_pid"
+
+    local newest=""
+    newest=$(ls -t "$LOG_DIR"/logs/touch-*.log 2>/dev/null | head -1 || true)
+    if [ -n "$newest" ]; then
+        say "hook log: $newest"
+        if grep -q "NTR_READY" "$newest" 2>/dev/null; then
+            say "hook result: NTR_READY"
+        elif grep -q "NTR_ABORT" "$newest" 2>/dev/null; then
+            warn "hook aborted: $(grep -m1 NTR_ABORT "$newest")"
+        fi
+    fi
+}
+
+cmd_attach() {
+    preflight_run
+    local pid="${TARGET_PID}"
+    if [ -z "$pid" ]; then
+        pid=$(game_pid_in_prefix 2>/dev/null || true)
+        if [ -z "$pid" ]; then
+            pid=$(pids_by_maps "$TARGET_NAME" 2>/dev/null)
+            pid=${pid%%[[:space:]]*}
+        fi
+        [ -n "$pid" ] || die "no running $TARGET_NAME (use --pid)"
+    fi
+    echo "zzz-touch-unlocker (wine) attach"
+    echo "  pid    = $pid"
+    echo "  prefix = $PREFIX"
+    echo "  dll    = $DLL"
+    echo "  mode   = $MODE"
+    write_mode_file
+    inject_hook "$pid"
+}
+
+cmd_status() {
+    echo "zzz-touch-unlocker (wine) status"
+    echo "  config = ${CONFIG:-<none>}"
+    echo "  game   = ${GAME_EXE:-<not found>}"
+    if [ -n "$GAME_EXE" ] && [ -f "$GAME_EXE" ]; then echo "  game   : present"; else echo "  game   : MISSING"; fi
+    echo "  prefix = ${PREFIX:-<none>}$([ -n "$PREFIX" ] && [ -d "$PREFIX" ] && echo ' (present)' || echo ' (MISSING)')"
+    echo "  runner = ${RUNNER:-<none>}$([ -n "$RUNNER" ] && [ -x "${RUNNER}/bin/wine" ] && echo ' (present)' || echo ' (MISSING)')"
+    echo "  dll    = $DLL$([ -f "$DLL" ] && echo ' (present)' || echo ' (MISSING)')"
+    echo "  inject = $INJECT_EXE$([ -f "$INJECT_EXE" ] && echo ' (present)' || echo ' (MISSING)')"
+    echo "  logdir = $LOG_DIR"
+
+    local game clients dev outside
+    game=$(game_pids_in_prefix 2>/dev/null | tr '\n' ' ')
+    echo "  running game pids: ${game:-none}"
+    outside=$(game_pids_outside_prefix 2>/dev/null | tr '\n' ' ')
+    [ -n "${outside// /}" ] && echo "  same name elsewhere: $outside(not a client of this prefix; left alone)"
+    if [ -n "$PREFIX" ] && [ -d "$PREFIX" ]; then
+        clients=$(prefix_clients | tr '\n' ' ')
+        echo "  prefix clients   : ${clients:-none}$([ -z "${clients// /}" ] && echo ' (clean: game can start)')"
+        dev=$(pids_by_comm winedevice.exe | tr '\n' ' ')
+        echo "  winedevice       : ${dev:-none}"
+        local plog
+        plog=$(player_log_path 2>/dev/null || true)
+        [ -n "$plog" ] && echo "  player.log       : $plog"
+    fi
+    local newest
+    newest=$(ls -t "$LOG_DIR"/logs/touch-*.log 2>/dev/null | head -1 || true)
+    if [ -n "$newest" ]; then
+        echo "  newest hook log  : $newest"
+        tail -n 6 "$newest" | sed 's/^/    /'
+    fi
+}
+
+main() {
+    parse_args "$@"
+    load_config
+    resolve_paths
+    case "$CMD" in
+        run) cmd_run ;;
+        attach) cmd_attach ;;
+        clean) cmd_clean ;;
+        status) cmd_status ;;
+        *) die "unknown command: $CMD" ;;
+    esac
+}
+
+main "$@"
